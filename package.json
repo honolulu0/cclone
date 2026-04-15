@@ -1,0 +1,13 @@
+{
+  "name": "cclone-launcher",
+  "private": true,
+  "version": "1.0.0",
+  "description": "Clean launcher for a replicated Codex desktop app",
+  "scripts": {
+    "start": "node ./start.cjs",
+    "start:debug": "node ./start.cjs --enable-logging"
+  },
+  "devDependencies": {
+    "electron": "40.0.0"
+  }
+}

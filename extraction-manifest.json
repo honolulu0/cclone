@@ -1,0 +1,30 @@
+{
+  "createdAt": "2026-04-15T08:19:17.207Z",
+  "targetRoot": "D:\\niuma\\OpenAI.Codex_26.325.3894.0_x64\\cclone",
+  "sourceAsar": "D:\\niuma\\OpenAI.Codex_26.325.3894.0_x64\\app\\resources\\app.asar",
+  "extractedRoot": "D:\\niuma\\OpenAI.Codex_26.325.3894.0_x64\\cclone\\app",
+  "fileCount": 827,
+  "totalBytes": 53454876,
+  "mergedUnpackedIntoApp": true,
+  "copiedUnpacked": true,
+  "copiedNative": true,
+  "copiedResourceFiles": [
+    "notification.wav",
+    "codex",
+    "codex.exe",
+    "codex-command-runner.exe",
+    "codex-windows-sandbox-setup.exe",
+    "rg",
+    "rg.exe",
+    "THIRD_PARTY_NOTICES.txt"
+  ],
+  "keyPaths": [
+    "package.json",
+    ".vite/build/bootstrap.js",
+    ".vite/build/preload.js",
+    "webview/index.html",
+    ".vite\\build\\main-I2_kj945.js",
+    "webview\\assets\\index-CQAG2N8w.js",
+    "webview\\assets\\index-Ct6OMwRl.css"
+  ]
+}
