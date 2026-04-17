@@ -1,3 +1,5 @@
+const fs = require("node:fs");
+const path = require("node:path");
 const http = require("node:http");
 const { URL } = require("node:url");
 
@@ -5,6 +7,16 @@ const DEFAULT_HOST = "127.0.0.1";
 const DEFAULT_PORT = 8765;
 const DEFAULT_TIMEOUT_MS = 10 * 60 * 1000;
 const MAX_BODY_BYTES = 1024 * 1024;
+const REQUEST_BRIDGE_LOG_PATH = path.resolve(
+  __dirname,
+  "..",
+  "..",
+  "..",
+  "cclone-control-v3",
+  "data",
+  "logs",
+  "request-bridge.ndjson",
+);
 
 let activeServer = null;
 
@@ -16,16 +28,22 @@ function startExternalApiServer({ appServerConnection, windowContext }) {
   const host = (process.env.CODEX_EXTERNAL_API_HOST || DEFAULT_HOST).trim() || DEFAULT_HOST;
   const port = parsePort(process.env.CODEX_EXTERNAL_API_PORT, DEFAULT_PORT);
   const token = normalizeOptionalString(process.env.CODEX_EXTERNAL_API_TOKEN);
+  const requestBridge = createRequestBridge(appServerConnection);
 
   const server = http.createServer((req, res) => {
     handleRequest({
       req,
       res,
       appServerConnection,
+      requestBridge,
       windowContext,
       token,
     }).catch((error) => {
-      console.error(`[cclone][external-api] request failed\n${formatError(error)}`);
+      if (error?.expected === true) {
+        console.warn(`[cclone][external-api] request handled\n${error.message || String(error)}`);
+      } else {
+        console.error(`[cclone][external-api] request failed\n${formatError(error)}`);
+      }
       if (!res.headersSent) {
         writeJson(res, getErrorStatusCode(error), { error: error.message || String(error) });
         return;
@@ -52,6 +70,7 @@ function startExternalApiServer({ appServerConnection, windowContext }) {
 
   activeServer = {
     dispose() {
+      requestBridge.dispose();
       server.close();
       activeServer = null;
     },
@@ -64,6 +83,7 @@ async function handleRequest({
   req,
   res,
   appServerConnection,
+  requestBridge,
   windowContext,
   token,
 }) {
@@ -97,6 +117,21 @@ async function handleRequest({
     return;
   }
 
+  if (req.method === "GET" && pathname === "/api/debug/app-server-connection") {
+    writeJson(res, 200, describeAppServerConnection(appServerConnection));
+    return;
+  }
+
+  if (req.method === "GET" && pathname === "/api/debug/pending-requests") {
+    writeJson(res, 200, describePendingRequests(appServerConnection));
+    return;
+  }
+
+  if (req.method === "GET" && pathname === "/api/debug/request-bridge") {
+    writeJson(res, 200, requestBridge.getDebugState());
+    return;
+  }
+
   if (req.method === "GET" && pathname === "/api/models") {
     const result = await appServerConnection.listModels({
       includeHidden: true,
@@ -109,6 +144,28 @@ async function handleRequest({
 
   if (req.method === "GET" && pathname === "/api/collaboration-modes") {
     const result = await appServerConnection.sendAppServerRequest("collaborationMode/list", {});
+    writeJson(res, 200, result);
+    return;
+  }
+
+  if (req.method === "GET" && pathname === "/api/config") {
+    const result = await appServerConnection.sendAppServerRequest("config/read", {
+      includeLayers: parseBoolean(url.searchParams.get("includeLayers")),
+      cwd: normalizeOptionalString(url.searchParams.get("cwd")) ?? null,
+    });
+    writeJson(res, 200, result);
+    return;
+  }
+
+  if (req.method === "GET" && pathname === "/api/config/requirements") {
+    const result = await appServerConnection.sendAppServerRequest("configRequirements/read", {});
+    writeJson(res, 200, result);
+    return;
+  }
+
+  if (req.method === "PUT" && pathname === "/api/config") {
+    const body = await readJsonBody(req);
+    const result = await appServerConnection.sendAppServerRequest("config/batchWrite", body);
     writeJson(res, 200, result);
     return;
   }
@@ -133,7 +190,11 @@ async function handleRequest({
   if (req.method === "GET" && threadMatch) {
     const threadId = decodeURIComponent(threadMatch[1]);
     const includeTurns = parseBoolean(url.searchParams.get("includeTurns"));
-    const thread = await appServerConnection.readThread(threadId, { includeTurns });
+    const thread = await readThreadEnsuringAvailability({
+      appServerConnection,
+      threadId,
+      includeTurns,
+    });
     writeJson(res, 200, { thread });
     return;
   }
@@ -160,6 +221,22 @@ async function handleRequest({
     return;
   }
 
+  const messageStreamMatch = pathname.match(/^\/api\/threads\/([^/]+)\/messages\/stream$/);
+  if (req.method === "POST" && messageStreamMatch) {
+    const body = await readJsonBody(req);
+    const threadId = decodeURIComponent(messageStreamMatch[1]);
+    await handleChatStreamRequest({
+      req,
+      res,
+      appServerConnection,
+      body: {
+        ...body,
+        threadId,
+      },
+    });
+    return;
+  }
+
   const messageMatch = pathname.match(/^\/api\/threads\/([^/]+)\/messages$/);
   if (req.method === "POST" && messageMatch) {
     const body = await readJsonBody(req);
@@ -172,6 +249,37 @@ async function handleRequest({
       },
     });
     writeJson(res, 200, result);
+    return;
+  }
+
+  const threadEventsMatch = pathname.match(/^\/api\/threads\/([^/]+)\/events$/);
+  if (req.method === "GET" && threadEventsMatch) {
+    const threadId = decodeURIComponent(threadEventsMatch[1]);
+    await handleThreadEventsRequest({
+      req,
+      res,
+      appServerConnection,
+      threadId,
+      includeTurns: parseBoolean(url.searchParams.get("includeTurns")),
+    });
+    return;
+  }
+
+  if (req.method === "GET" && pathname === "/api/thread-events") {
+    await handleGlobalThreadEventsRequest({
+      req,
+      res,
+      appServerConnection,
+    });
+    return;
+  }
+
+  if (req.method === "GET" && pathname === "/api/thread-requests") {
+    await handleThreadRequestsRequest({
+      req,
+      res,
+      requestBridge,
+    });
     return;
   }
 
@@ -257,36 +365,10 @@ async function handleChatRequest({ appServerConnection, body }) {
 }
 
 async function handleChatStreamRequest({ req, res, appServerConnection, body }) {
-  res.writeHead(200, {
-    "Content-Type": "text/event-stream; charset=utf-8",
-    "Cache-Control": "no-cache, no-transform",
-    Connection: "keep-alive",
-    "X-Accel-Buffering": "no",
-  });
-
-  if (typeof res.flushHeaders === "function") {
-    res.flushHeaders();
-  }
-
+  const sse = createSseSession({ req, res });
+  const { sendEvent, close } = sse;
   const state = {
-    closed: false,
     turnId: null,
-  };
-
-  const onClose = () => {
-    state.closed = true;
-  };
-
-  req.on("close", onClose);
-  req.on("aborted", onClose);
-
-  const sendEvent = (event, payload) => {
-    if (state.closed) {
-      return;
-    }
-
-    res.write(`event: ${event}\n`);
-    res.write(`data: ${JSON.stringify(payload)}\n\n`);
   };
 
   try {
@@ -332,12 +414,109 @@ async function handleChatStreamRequest({ req, res, appServerConnection, body }) 
       error: error.message || String(error),
     });
   } finally {
-    req.off("close", onClose);
-    req.off("aborted", onClose);
+    close();
+  }
+}
 
-    if (!state.closed) {
-      res.end();
+async function handleThreadEventsRequest({
+  req,
+  res,
+  appServerConnection,
+  threadId,
+  includeTurns,
+}) {
+  const sse = createSseSession({ req, res, keepAliveMs: 15000 });
+  const { sendEvent, isClosed, close } = sse;
+  let unsubscribe = null;
+
+  try {
+    const thread = await readThreadEnsuringAvailability({
+      appServerConnection,
+      threadId,
+      includeTurns,
+    });
+    sendEvent("thread.snapshot", {
+      threadId,
+      thread: thread?.thread ?? thread ?? null,
+    });
+
+    unsubscribe = appServerConnection.registerInternalNotificationHandler((notification) => {
+      if (isClosed()) {
+        return;
+      }
+
+      const mapped = mapThreadNotificationToEvent(notification, threadId);
+      if (!mapped) {
+        return;
+      }
+
+      sendEvent(mapped.event, mapped.payload);
+    });
+
+    await waitForRequestClose(req);
+  } finally {
+    unsubscribe?.();
+    close();
+  }
+}
+
+async function handleGlobalThreadEventsRequest({
+  req,
+  res,
+  appServerConnection,
+}) {
+  const sse = createSseSession({ req, res, keepAliveMs: 15000 });
+  const { sendEvent, isClosed, close } = sse;
+  let unsubscribe = null;
+
+  try {
+    sendEvent("thread.feed.ready", {
+      timestamp: new Date().toISOString(),
+    });
+
+    unsubscribe = appServerConnection.registerInternalNotificationHandler((notification) => {
+      if (isClosed()) {
+        return;
+      }
+
+      const mapped = mapAnyThreadNotificationToEvent(notification);
+      if (!mapped) {
+        return;
+      }
+
+      sendEvent(mapped.event, mapped.payload);
+    });
+
+    await waitForRequestClose(req);
+  } finally {
+    unsubscribe?.();
+    close();
+  }
+}
+
+async function handleThreadRequestsRequest({
+  req,
+  res,
+  requestBridge,
+}) {
+  const sse = createSseSession({ req, res, keepAliveMs: 15000 });
+  const { sendEvent, isClosed, close } = sse;
+
+  const unsubscribe = requestBridge.subscribe((eventName, payload) => {
+    if (isClosed()) {
+      return;
     }
+    sendEvent(eventName, payload);
+  });
+
+  try {
+    sendEvent("request.snapshot", {
+      requests: requestBridge.listRequests(),
+    });
+    await waitForRequestClose(req);
+  } finally {
+    unsubscribe();
+    close();
   }
 }
 
@@ -364,6 +543,54 @@ async function ensureThreadId({ appServerConnection, body }) {
   return createdThreadId;
 }
 
+async function readThreadEnsuringAvailability({
+  appServerConnection,
+  threadId,
+  includeTurns,
+}) {
+  try {
+    return await appServerConnection.readThread(threadId, { includeTurns });
+  } catch (error) {
+    if (includeTurns && isThreadTurnsUnavailableError(error)) {
+      const thread = await appServerConnection.readThread(threadId, { includeTurns: false });
+      return {
+        ...thread,
+        thread: thread?.thread
+          ? {
+              ...thread.thread,
+              turns: [],
+            }
+          : undefined,
+        turns: Array.isArray(thread?.turns) ? [] : thread?.turns,
+      };
+    }
+
+    if (!isThreadNotFoundError(error) || !normalizeOptionalString(threadId)) {
+      throw error;
+    }
+
+    const metadata = await findThreadMetadataById({ appServerConnection, threadId });
+    if (!metadata) {
+      throw expectedHttpError(404, `thread unavailable: ${threadId}`);
+    }
+    await appServerConnection.resumeThread(threadId, {
+      cwd: metadata?.cwd ?? null,
+      path: metadata?.path ?? null,
+      developerInstructions: null,
+      persistExtendedHistory: false,
+    });
+
+    try {
+      return await appServerConnection.readThread(threadId, { includeTurns });
+    } catch (resumeError) {
+      if (isThreadNotFoundError(resumeError)) {
+        throw expectedHttpError(404, `thread unavailable: ${threadId}`);
+      }
+      throw resumeError;
+    }
+  }
+}
+
 async function startTurnEnsuringThreadAvailability({
   appServerConnection,
   threadId,
@@ -377,14 +604,55 @@ async function startTurnEnsuringThreadAvailability({
       throw error;
     }
 
+    const metadata = await findThreadMetadataById({ appServerConnection, threadId });
+    if (!metadata) {
+      throw expectedHttpError(409, `thread unavailable for send: ${threadId}`);
+    }
     await appServerConnection.resumeThread(threadId, {
-      cwd: nullableValue(body.cwd),
+      cwd: nullableValue(body.cwd) ?? metadata?.cwd ?? null,
+      path: metadata?.path ?? null,
       developerInstructions: nullableValue(body.developerInstructions),
       persistExtendedHistory: false,
     });
 
-    return appServerConnection.startTurn(turnRequest);
+    try {
+      return await appServerConnection.startTurn(turnRequest);
+    } catch (resumeError) {
+      if (isThreadNotFoundError(resumeError)) {
+        throw expectedHttpError(409, `thread unavailable for send: ${threadId}`);
+      }
+      throw resumeError;
+    }
   }
+}
+
+async function findThreadMetadataById({
+  appServerConnection,
+  threadId,
+  limit = 200,
+  maxPages = 20,
+}) {
+  let cursor = null;
+
+  for (let page = 0; page < maxPages; page += 1) {
+    const result = await appServerConnection.sendAppServerRequest("thread/list", {
+      limit,
+      cursor,
+      archived: false,
+    });
+    const rows = Array.isArray(result?.data) ? result.data : [];
+    const match = rows.find((row) => row?.id === threadId) || null;
+    if (match) {
+      return match;
+    }
+
+    cursor = normalizeOptionalString(result?.nextCursor);
+    if (!cursor) {
+      break;
+    }
+  }
+
+  return null;
 }
 
 function normalizeThreadStartRequest(body) {
@@ -662,6 +930,186 @@ function extractLastAssistantMessage(thread) {
   return null;
 }
 
+function createSseSession({ req, res, keepAliveMs = 0 }) {
+  res.writeHead(200, {
+    "Content-Type": "text/event-stream; charset=utf-8",
+    "Cache-Control": "no-cache, no-transform",
+    Connection: "keep-alive",
+    "X-Accel-Buffering": "no",
+  });
+
+  if (typeof res.flushHeaders === "function") {
+    res.flushHeaders();
+  }
+
+  const state = {
+    closed: false,
+  };
+
+  const onClose = () => {
+    state.closed = true;
+  };
+
+  req.on("close", onClose);
+  req.on("aborted", onClose);
+
+  const keepAlive =
+    keepAliveMs > 0
+      ? setInterval(() => {
+          if (state.closed) {
+            return;
+          }
+          res.write(": keepalive\n\n");
+        }, keepAliveMs)
+      : null;
+
+  return {
+    sendEvent(event, payload) {
+      if (state.closed) {
+        return;
+      }
+
+      res.write(`event: ${event}\n`);
+      res.write(`data: ${JSON.stringify(payload)}\n\n`);
+    },
+    isClosed() {
+      return state.closed;
+    },
+    close() {
+      req.off("close", onClose);
+      req.off("aborted", onClose);
+      if (keepAlive) {
+        clearInterval(keepAlive);
+      }
+      if (!state.closed) {
+        state.closed = true;
+        res.end();
+      }
+    },
+  };
+}
+
+function waitForRequestClose(req) {
+  return new Promise((resolve) => {
+    const cleanup = () => {
+      req.off("close", onClose);
+      req.off("aborted", onAborted);
+    };
+
+    const onClose = () => {
+      cleanup();
+      resolve();
+    };
+
+    const onAborted = () => {
+      cleanup();
+      resolve();
+    };
+
+    req.on("close", onClose);
+    req.on("aborted", onAborted);
+  });
+}
+
+function mapThreadNotificationToEvent(notification, threadId) {
+  const params = notification?.params;
+  if (params?.threadId !== threadId) {
+    return null;
+  }
+
+  return mapAnyThreadNotificationToEvent(notification);
+}
+
+function mapAnyThreadNotificationToEvent(notification) {
+  const params = notification?.params;
+  const threadId = normalizeOptionalString(params?.threadId);
+  if (!threadId) {
+    return null;
+  }
+
+  switch (notification.method) {
+    case "thread/status/changed":
+      return {
+        event: "thread.status",
+        payload: {
+          threadId,
+          status: params.status ?? null,
+        },
+      };
+    case "turn/started":
+      return {
+        event: "turn.started",
+        payload: {
+          threadId,
+          turnId: params.turn?.id ?? params.turnId ?? null,
+          turn: params.turn ?? null,
+        },
+      };
+    case "turn/completed":
+      return {
+        event: "turn.completed",
+        payload: {
+          threadId,
+          turnId: params.turn?.id ?? params.turnId ?? null,
+          turn: params.turn ?? null,
+        },
+      };
+    case "item/started":
+      return {
+        event: "item.started",
+        payload: {
+          threadId,
+          turnId: params.turnId ?? null,
+          item: params.item ?? null,
+        },
+      };
+    case "item/completed":
+      return {
+        event: "item.completed",
+        payload: {
+          threadId,
+          turnId: params.turnId ?? null,
+          item: params.item ?? null,
+        },
+      };
+    case "item/agentMessage/delta":
+      return {
+        event: "item.delta",
+        payload: {
+          threadId,
+          turnId: params.turnId ?? null,
+          itemId: params.itemId ?? null,
+          delta: typeof params.delta === "string" ? params.delta : "",
+        },
+      };
+    case "thread/archived":
+      return {
+        event: "thread.archived",
+        payload: {
+          threadId,
+        },
+      };
+    case "thread/unarchived":
+      return {
+        event: "thread.unarchived",
+        payload: {
+          threadId,
+        },
+      };
+    case "error":
+      return {
+        event: "thread.error",
+        payload: {
+          threadId,
+          error: params.error ?? null,
+          turnId: params.turnId ?? null,
+        },
+      };
+    default:
+      return null;
+  }
+}
+
 function readJsonBody(req) {
   return new Promise((resolve, reject) => {
     let body = "";
@@ -774,6 +1222,334 @@ function stripUndefined(value) {
   return Object.fromEntries(Object.entries(value).filter(([, entry]) => entry !== undefined && entry !== null));
 }
 
+function createRequestBridge(appServerConnection) {
+  const requests = new Map();
+  const listeners = new Set();
+  const originalHandleClientRequestMethod = typeof appServerConnection.handleClientRequest === "function"
+    ? appServerConnection.handleClientRequest
+    : null;
+  const originalHandleClientRequest = originalHandleClientRequestMethod == null
+    ? null
+    : originalHandleClientRequestMethod.bind(appServerConnection);
+  const originalRouteIncomingMessageMethod = typeof appServerConnection.routeIncomingMessage === "function"
+    ? appServerConnection.routeIncomingMessage
+    : null;
+  const originalRouteIncomingMessage = originalRouteIncomingMessageMethod == null
+    ? null
+    : originalRouteIncomingMessageMethod.bind(appServerConnection);
+  const debugState = {
+    handledClientRequestCount: 0,
+    routedIncomingMessageCount: 0,
+    matchedClientRequestMethods: [],
+    matchedIncomingMethods: [],
+    lastClientRequest: null,
+    lastIncomingMessage: null,
+  };
+
+  const notify = (eventName, payload) => {
+    for (const listener of listeners) {
+      listener(eventName, payload);
+    }
+  };
+
+  const upsertRequest = (request) => {
+    const normalized = normalizeRequestRecord(request);
+    if (!normalized) {
+      writeRequestBridgeLog({
+        kind: "request.ignored",
+        source: "handleClientRequest",
+        raw: summarizeRawRequest(request),
+      });
+      return;
+    }
+    requests.set(normalized.id, normalized);
+    writeRequestBridgeLog({
+      kind: "request.created",
+      source: "handleClientRequest",
+      request: normalized,
+    });
+    notify("request.created", normalized);
+  };
+
+  const resolveRequest = (requestId, threadId) => {
+    const normalizedRequestId = normalizeRequestId(requestId);
+    if (!normalizedRequestId) {
+      return;
+    }
+
+    requests.delete(normalizedRequestId);
+    writeRequestBridgeLog({
+      kind: "request.resolved",
+      source: "notification",
+      requestId: normalizedRequestId,
+      threadId: normalizeOptionalString(threadId),
+    });
+    notify("request.resolved", {
+      requestId: normalizedRequestId,
+      threadId: normalizeOptionalString(threadId),
+    });
+  };
+
+  if (originalHandleClientRequest) {
+    appServerConnection.handleClientRequest = function (...args) {
+      const request = args[0];
+      debugState.handledClientRequestCount += 1;
+      debugState.lastClientRequest = summarizeRawRequest(request);
+      const method = normalizeOptionalString(request?.method);
+      writeRequestBridgeLog({
+        kind: "handleClientRequest",
+        matched: Boolean(method && isTrackedRequestMethod(method)),
+        method: method || null,
+        raw: summarizeRawRequest(request),
+      });
+      if (method && isTrackedRequestMethod(method)) {
+        debugState.matchedClientRequestMethods.push(method);
+        debugState.lastClientRequest = summarizeRawRequest(request);
+      }
+      upsertRequest(request);
+      return originalHandleClientRequest(...args);
+    };
+  }
+
+  if (originalRouteIncomingMessage) {
+    appServerConnection.routeIncomingMessage = function (...args) {
+      const message = args[0];
+      debugState.routedIncomingMessageCount += 1;
+      debugState.lastIncomingMessage = summarizeRawRequest(message);
+      const method = normalizeOptionalString(message?.method);
+      writeRequestBridgeLog({
+        kind: "routeIncomingMessage",
+        matched: Boolean(method && isTrackedRequestMethod(method)),
+        method: method || null,
+        raw: summarizeRawRequest(message),
+      });
+      if (method && isTrackedRequestMethod(method)) {
+        debugState.matchedIncomingMethods.push(method);
+        debugState.lastIncomingMessage = summarizeRawRequest(message);
+        upsertRequest(message);
+      }
+      return originalRouteIncomingMessage(...args);
+    };
+  }
+
+  const unsubscribeNotification = appServerConnection.registerInternalNotificationHandler((notification) => {
+    if (notification?.method !== "serverRequest/resolved") {
+      return;
+    }
+
+    const params = notification?.params || {};
+    resolveRequest(params.requestId, params.threadId);
+  });
+
+  return {
+    dispose() {
+      if (originalHandleClientRequestMethod) {
+        appServerConnection.handleClientRequest = originalHandleClientRequestMethod;
+      }
+      if (originalRouteIncomingMessageMethod) {
+        appServerConnection.routeIncomingMessage = originalRouteIncomingMessageMethod;
+      }
+      unsubscribeNotification?.();
+      listeners.clear();
+      requests.clear();
+    },
+    getDebugState() {
+      return {
+        ...debugState,
+        matchedClientRequestMethods: [...debugState.matchedClientRequestMethods],
+        matchedIncomingMethods: [...debugState.matchedIncomingMethods],
+      };
+    },
+    subscribe(listener) {
+      listeners.add(listener);
+      return () => {
+        listeners.delete(listener);
+      };
+    },
+    listRequests() {
+      return [...requests.values()];
+    },
+  };
+}
+
+function normalizeRequestRecord(request) {
+  if (!request || typeof request !== "object") {
+    return null;
+  }
+
+  const id = normalizeRequestId(request.id);
+  const method = normalizeOptionalString(request.method);
+  const params = request.params && typeof request.params === "object" ? request.params : {};
+  if (!id || !method) {
+    return null;
+  }
+
+  const threadId = normalizeOptionalString(params.threadId);
+  const turnId = normalizeOptionalString(params.turnId);
+  const itemId = normalizeOptionalString(params.itemId);
+
+  return {
+    id,
+    method,
+    kind: classifyRequestMethod(method),
+    threadId,
+    turnId,
+    itemId,
+    createdAt: new Date().toISOString(),
+    params,
+  };
+}
+
+function classifyRequestMethod(method) {
+  switch (method) {
+    case "item/commandExecution/requestApproval":
+      return "commandApproval";
+    case "item/fileChange/requestApproval":
+      return "fileApproval";
+    case "item/tool/requestUserInput":
+      return "userInput";
+    case "mcpServer/elicitation/request":
+      return "mcpElicitation";
+    default:
+      return "other";
+  }
+}
+
+function describeAppServerConnection(appServerConnection) {
+  const ownPropertyNames = Object.getOwnPropertyNames(appServerConnection || {});
+  const prototype = Object.getPrototypeOf(appServerConnection);
+  const ownDescriptors = Object.getOwnPropertyDescriptors(appServerConnection || {});
+  const prototypeDescriptors = prototype == null ? {} : Object.getOwnPropertyDescriptors(prototype);
+
+  const ownMethodNames = Object.entries(ownDescriptors)
+    .filter(([, descriptor]) => typeof descriptor.value === "function")
+    .map(([name]) => name);
+  const prototypeMethodNames = Object.entries(prototypeDescriptors)
+    .filter(([name, descriptor]) => name !== "constructor" && typeof descriptor.value === "function")
+    .map(([name]) => name);
+
+  const allMethodNames = [...new Set([...ownMethodNames, ...prototypeMethodNames])].sort();
+
+  return {
+    ownPropertyNames: ownPropertyNames.sort(),
+    ownMethodNames: ownMethodNames.sort(),
+    prototypeMethodNames: prototypeMethodNames.sort(),
+    methodNames: allMethodNames,
+    requestRelatedMethods: allMethodNames.filter((name) => /request|notification|approval|input/i.test(name)),
+  };
+}
+
+function describePendingRequests(appServerConnection) {
+  const pendingRequests = appServerConnection?.pendingRequests;
+  if (!(pendingRequests instanceof Map)) {
+    return {
+      type: typeof pendingRequests,
+      isMap: false,
+      size: 0,
+      items: [],
+    };
+  }
+
+  const items = [];
+  for (const [key, value] of pendingRequests.entries()) {
+    items.push({
+      key,
+      valueType: typeof value,
+      ownPropertyNames: value && typeof value === "object" ? Object.getOwnPropertyNames(value).sort() : [],
+      summary: summarizePendingRequestValue(value),
+    });
+  }
+
+  return {
+    type: "object",
+    isMap: true,
+    size: pendingRequests.size,
+    items,
+  };
+}
+
+function summarizePendingRequestValue(value) {
+  if (!value || typeof value !== "object") {
+    return value;
+  }
+
+  const summary = {};
+  for (const [key, entry] of Object.entries(value)) {
+    if (key === "params" && entry && typeof entry === "object") {
+      summary.paramsKeys = Object.keys(entry).sort();
+      summary.threadId = typeof entry.threadId === "string" ? entry.threadId : null;
+      summary.turnId = typeof entry.turnId === "string" ? entry.turnId : null;
+      continue;
+    }
+
+    if (typeof entry === "string" || typeof entry === "number" || typeof entry === "boolean" || entry == null) {
+      summary[key] = entry;
+    }
+  }
+  return summary;
+}
+
+function summarizeRawRequest(value) {
+  if (!value || typeof value !== "object") {
+    return value;
+  }
+
+  const summary = {
+    ownPropertyNames: Object.getOwnPropertyNames(value).sort(),
+  };
+
+  for (const [key, entry] of Object.entries(value)) {
+    if (typeof entry === "string" || typeof entry === "number" || typeof entry === "boolean" || entry == null) {
+      summary[key] = entry;
+      continue;
+    }
+
+    if (key === "params" && entry && typeof entry === "object") {
+      summary.paramsKeys = Object.keys(entry).sort();
+      summary.threadId = typeof entry.threadId === "string" ? entry.threadId : null;
+      summary.turnId = typeof entry.turnId === "string" ? entry.turnId : null;
+      summary.itemId = typeof entry.itemId === "string" ? entry.itemId : null;
+    }
+  }
+
+  return summary;
+}
+
+function isTrackedRequestMethod(method) {
+  return [
+    "item/commandExecution/requestApproval",
+    "item/fileChange/requestApproval",
+    "item/tool/requestUserInput",
+    "mcpServer/elicitation/request",
+  ].includes(method);
+}
+
+function normalizeRequestId(value) {
+  if (typeof value === "string") {
+    const trimmed = value.trim();
+    return trimmed.length > 0 ? trimmed : null;
+  }
+
+  if (typeof value === "number" && Number.isFinite(value)) {
+    return String(value);
+  }
+
+  return null;
+}
+
+function writeRequestBridgeLog(entry) {
+  try {
+    fs.mkdirSync(path.dirname(REQUEST_BRIDGE_LOG_PATH), { recursive: true });
+    fs.appendFileSync(
+      REQUEST_BRIDGE_LOG_PATH,
+      `${JSON.stringify({ timestamp: new Date().toISOString(), ...entry })}\n`,
+      "utf8",
+    );
+  } catch (error) {
+    console.warn(`[cclone][external-api] request bridge log write failed\n${formatError(error)}`);
+  }
+}
+
 function delay(ms) {
   return new Promise((resolve) => {
     setTimeout(resolve, ms);
@@ -786,7 +1562,20 @@ function isThreadStartTimeoutError(error) {
 }
 
 function isThreadNotFoundError(error) {
-  return formatError(error).toLowerCase().includes("thread not found");
+  const message = formatError(error).toLowerCase();
+  return (
+    message.includes("thread not found") ||
+    message.includes("thread not loaded") ||
+    message.includes("no rollout found")
+  );
+}
+
+function isThreadTurnsUnavailableError(error) {
+  const message = formatError(error).toLowerCase();
+  return (
+    message.includes("includeTurns is unavailable".toLowerCase()) ||
+    message.includes("not materialized yet")
+  );
 }
 
 function formatError(error) {
@@ -799,6 +1588,13 @@ function formatError(error) {
 
 function getErrorStatusCode(error) {
   return Number.isInteger(error?.statusCode) ? error.statusCode : 500;
+}
+
+function expectedHttpError(statusCode, message) {
+  const error = new Error(message);
+  error.statusCode = statusCode;
+  error.expected = true;
+  return error;
 }
 
 module.exports = {
